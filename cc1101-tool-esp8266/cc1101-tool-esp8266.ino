@@ -87,6 +87,12 @@ int sniffCursor = 0;             // write position in the recording buffer
 int recrawInterval = 0;          // microseconds per sample while MODE_RECRAW captures
 bool recrawWaiting = false;      // true while armed and waiting for the RF line to go high
 int playrawInterval = 0;         // microseconds per sample while MODE_PLAYRAW replays
+// Watchdog-safe caps for RAW per-sample intervals. Every RAW path clamps to one of these so a
+// single delayMicroseconds() can never overrun the ESP8266 watchdog. RECRAW/PLAYRAW run as one
+// continuous block, so their cap keeps 4096 B x 8 bits under the hardware WDT (150 us ~= 4.9 s).
+// RXRAW/BRUTE return to loop() between chunks, so they tolerate a looser cap. Tuned on-device.
+#define RAW_MAX_INTERVAL        150
+#define RAW_CHUNK_MAX_INTERVAL  1000
 
 // brute mode state (a batch of codes serviced per loop pass)
 int bruteInterval = 0, bruteBits = 0;
@@ -267,6 +273,21 @@ static void startActiveMode(Mode mode)
     modeStartedAt = millis();
     lastModeFeedbackAt = modeStartedAt;
     modeActivityCount = 0;
+}
+
+// Clamp a RAW per-sample interval to a watchdog-safe maximum, announcing when it clamps.
+// Guarantees no RAW path ever hands delayMicroseconds() an unbounded value.
+static int clampRawInterval(int usec, int maxUsec, const char *tag)
+{
+    if (usec > maxUsec) {
+        out->print(F("\r\n["));
+        out->print(tag);
+        out->print(F("] interval clamped to "));
+        out->print(maxUsec);
+        out->print(F(" us (max)\r\n"));
+        usec = maxUsec;
+    }
+    return usec;
 }
 
 static bool modeFeedbackDue(unsigned long intervalMs)
@@ -544,10 +565,10 @@ static void exec(char *cmdline)
           "  rx                         packet monitor on/off\r\n"
           "  rec                        record packets on/off\r\n"
           "  scan <from> <to>           sweep a MHz range\r\n"
-          "  rxraw <usec>               stream raw sampled blocks\r\n"
-          "  recraw <usec>              arm one 4096-byte capture\r\n"
-          "  playraw <usec>             replay raw buffer\r\n"
-          "  brute <usec> <bits>        test raw bit codes\r\n"
+          "  rxraw <usec>               stream raw blocks (usec/sample, max 1000)\r\n"
+          "  recraw <usec>              arm 4096-byte capture (usec/sample, max 150)\r\n"
+          "  playraw <usec>             replay raw buffer (usec/sample, max 150)\r\n"
+          "  brute <usec> <bits>        test raw bit codes (usec/symbol, max 1000)\r\n"
           "  jam                        random TX mode on/off\r\n"
           "  chat                       serial-over-RF chat mode\r\n"
           "  x                          stop active mode\r\n"
@@ -1023,7 +1044,7 @@ static void exec(char *cmdline)
     
     // handling BRUTE command
     } else if (strcmp_P(command, PSTR("brute")) == 0) {
-        bruteInterval = atoi(strsep(&cmdline, " "));
+        bruteInterval = clampRawInterval(atoi(strsep(&cmdline, " ")), RAW_CHUNK_MAX_INTERVAL, "BRUTE");
         bruteBits     = atoi(cmdline);
         if (bruteBits > 16) bruteBits = 16;
         bruteMax = (bruteBits > 0) ? (1UL << bruteBits) : 0;
@@ -1066,14 +1087,16 @@ static void exec(char *cmdline)
         // Non-blocking RAW capture: arm and return immediately. serviceActiveMode()
         // waits for the signal (one poll per loop pass) and then does the single
         // timing-coherent capture - off the /cmd path, so the web never hangs.
-        recrawInterval = atoi(cmdline);
+        recrawInterval = clampRawInterval(atoi(cmdline), RAW_MAX_INTERVAL, "RECRAW");
         if (recrawInterval > 0) {
             zeroRecordingBuffer();
             enterRawMode(false);
             pinMode(gdo0, INPUT);
-            out->print(F("\r\n[RECRAW] armed | waiting for GDO0 HIGH | sample "));
+            out->print(F("\r\n[RECRAW] armed | waiting for GDO0 HIGH | "));
             out->print(recrawInterval);
-            out->print(F(" us | capture 4096 bytes | stop with x\r\n"));
+            out->print(F(" us/sample | ~"));
+            out->print((float)recrawInterval * RECORDINGBUFFERSIZE * 8 / 1000000.0f, 1);
+            out->print(F(" s window | 4096 bytes | stop with x\r\n"));
             recrawWaiting = true;
             startActiveMode(MODE_RECRAW);
         }
@@ -1081,7 +1104,7 @@ static void exec(char *cmdline)
 
    // handling RXRAW command - sniffer
     } else if (strcmp_P(command, PSTR("rxraw")) == 0) {
-        sniffInterval = atoi(cmdline);
+        sniffInterval = clampRawInterval(atoi(cmdline), RAW_CHUNK_MAX_INTERVAL, "RXRAW");
         if (sniffInterval > 0) {
             zeroRecordingBuffer();
             enterRawMode(false);
@@ -1099,13 +1122,15 @@ static void exec(char *cmdline)
     } else if (strcmp_P(command, PSTR("playraw")) == 0) {
         // Non-blocking RAW replay: arm and return immediately. serviceActiveMode()
         // does the single timing-coherent replay off the /cmd path.
-        playrawInterval = atoi(cmdline);
+        playrawInterval = clampRawInterval(atoi(cmdline), RAW_MAX_INTERVAL, "PLAYRAW");
         if (playrawInterval > 0) {
             enterRawMode(true);
             pinMode(gdo0, OUTPUT);
-            out->print(F("\r\n[PLAYRAW] started | 4096 bytes | sample "));
+            out->print(F("\r\n[PLAYRAW] started | 4096 bytes | "));
             out->print(playrawInterval);
-            out->print(F(" us\r\n"));
+            out->print(F(" us/sample | ~"));
+            out->print((float)playrawInterval * RECORDINGBUFFERSIZE * 8 / 1000000.0f, 1);
+            out->print(F(" s\r\n"));
             startActiveMode(MODE_PLAYRAW);
         }
         else { out->print(F("Wrong parameters.\r\n")); }
@@ -1531,7 +1556,9 @@ static void serviceActiveMode(void)
                 out->print(F("s | GDO0 LOW\r\n"));
             }
         } else {
-            // one timing-coherent capture (the unavoidable, bounded block)
+            // one timing-coherent capture: soft WDT off for the duration so the unbroken
+            // block can't trip it; the interval clamp keeps the block under the hardware WDT.
+            ESP.wdtDisable();
             for (int i = 0; i < RECORDINGBUFFERSIZE; i++) {
                 byte receivedbyte = 0;
                 for (int j = 7; j > -1; j--) {
@@ -1541,6 +1568,7 @@ static void serviceActiveMode(void)
                 bigrecordingbuffer[i] = receivedbyte;
                 ESP.wdtFeed();
             }
+            ESP.wdtEnable(5000);
             modeActivityCount = RECORDINGBUFFERSIZE;
             bigrecordingbufferpos = RECORDINGBUFFERSIZE;
             out->print(F("[RECRAW] complete | 4096 bytes captured | elapsed "));
@@ -1552,7 +1580,9 @@ static void serviceActiveMode(void)
         }
     }
     else if (activeMode == MODE_PLAYRAW) {
-        // one timing-coherent replay (the unavoidable, bounded block)
+        // one timing-coherent replay: soft WDT off for the duration so the unbroken
+        // block can't trip it; the interval clamp keeps the block under the hardware WDT.
+        ESP.wdtDisable();
         for (int i = 1; i < RECORDINGBUFFERSIZE; i++) {
             byte receivedbyte = bigrecordingbuffer[i];
             for (int j = 7; j > -1; j--) {
@@ -1561,6 +1591,7 @@ static void serviceActiveMode(void)
             }
             ESP.wdtFeed();
         }
+        ESP.wdtEnable(5000);
         modeActivityCount = RECORDINGBUFFERSIZE;
         out->print(F("[PLAYRAW] complete | 4096 bytes replayed | elapsed "));
         out->print(modeElapsedSeconds());

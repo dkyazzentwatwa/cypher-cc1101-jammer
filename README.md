@@ -148,15 +148,15 @@ The web Apply button uses `applyradio`, so all profile registers are written onl
 
 | Command | Description |
 |---------|-------------|
-| `rxraw <usec>` | Sniff the radio at `<usec>` sampling interval and print hex (background mode) |
-| `recraw <usec>` | Record RAW RF data at `<usec>` sampling interval (starts on signal) |
-| `playraw <usec>` | Replay recorded RAW RF data at `<usec>` sampling interval |
+| `rxraw <usec>` | Sniff the radio at `<usec>` **per-sample** interval and print hex (background mode; max 1000 µs) |
+| `recraw <usec>` | Record RAW RF data at `<usec>` **per-sample** interval, starts on signal (max 150 µs → ~5 s window) |
+| `playraw <usec>` | Replay recorded RAW RF data at `<usec>` **per-sample** interval (max 150 µs) |
 | `addraw <hex-vals>` | Manually add RAW chunks (max 60 hex values) to the buffer |
 | `showraw` | Show the recording buffer in RAW hex format |
 | `showbit` | Show the recording buffer as a stream of bits |
 | `echo <0/1>` | Enable/disable command echo on the serial terminal |
 
-RAW bit order matches [Universal Radio Hacker](https://github.com/jopohl/urh). Always pass the `<microseconds>` argument to `rxraw`/`playraw` on ESP8266 WiFi builds. Run `init` after any RAW operation.
+RAW bit order matches [Universal Radio Hacker](https://github.com/jopohl/urh). The `<usec>` argument is the delay **per sample** (per bit), not a total window — a 4096-byte `recraw` spans about `usec × 32768` µs. It is required and is clamped to a watchdog-safe maximum (150 µs for `recraw`/`playraw`, 1000 µs for `rxraw`); pass an oversized value and the firmware clamps it and tells you. Run `init` after any RAW operation.
 
 </details>
 
@@ -281,13 +281,14 @@ Older separate WiFi variants (telnet client / telnet AP) also live in [`original
 - **WiFi AP + web control panel** — see [Web UI](#-web-ui-ap-mode) above.
 - **Non-blocking long-running commands** — SCAN, RXRAW (sniffer), BRUTE, RECRAW and PLAYRAW run as background modes so the web UI stays responsive (and on serial they return to the prompt immediately, stopping on any key or `x`). RECRAW no longer hangs waiting for a signal.
 - **Fixed the "BRUTE hangs after the full cycle" bug** — the RAW TX modes left GDO0 driven as an OUTPUT against the CC1101 (pin contention → watchdog reset). GDO0 is now released to INPUT on raw-mode exit; single-cycle brute is reliable.
+- **Fixed the `recraw`/`playraw` watchdog reset** — the capture/replay `<usec>` is the delay *per sample*, so an oversized value (e.g. `recraw 4000000`) made a single `delayMicroseconds()` busy-wait for seconds and trip the software watchdog before it was ever fed. All RAW intervals are now clamped to a watchdog-safe maximum, and the continuous capture/replay block runs with the soft WDT suspended for its (now bounded) duration — so `recraw`/`playraw` complete instead of resetting the board.
 
 ---
 
 ## ⚠️ Known issues
 
 - In packet mode, `rx` can misbehave after many large frames have been received — suspected memory leak in the SmartRC library.
-- Always pass the `<microseconds>` argument to `rxraw`/`playraw` on ESP8266 WiFi builds, otherwise the board can reset (stack overflow).
+- The RAW `<usec>` values are a delay *per sample*, not a total window; very large values are clamped to a watchdog-safe maximum (150 µs for `recraw`/`playraw`, 1000 µs for `rxraw`). Earlier firmware reset the board on oversized values — fixed in 2026 (see above).
 - On the ESP8266 WiFi/AP build, `brute` with many bits (roughly 5+, i.e. more than 16 codes) can still trigger a watchdog reset while the AP is running — a single-core WiFi vs. bit-bang timing limitation. Small bit-counts are reliable.
 
 ---
